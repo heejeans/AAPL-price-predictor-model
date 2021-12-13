@@ -1,0 +1,215 @@
+---
+title: "stock-predictor-model"
+output: html_document
+---
+
+```{r}
+library(rtweet)
+library(tidyquant)
+library(lubridate)
+library(tidyverse)
+library(tidytext)
+library(dplyr)
+library(hablar)
+library(ggthemes)
+library(tidymodels)
+library(tidyr)
+set.seed(7)
+```
+
+```{r, include=FALSE}
+key = "YNXdhqJoK5SmZwpYoyY2lpAGq"
+secret = "rqA7mymbbZvEZSNvkasQWAydKziSYoKV3YoJTudz0puUgl0LiQ"
+access = "1435424040613605379-J52qfNQNufhqJ3JU0YJgNLgacnmRyh"
+access_secret = "oOx6r17b6uamATJLaUUwcKtJPOkJQGxPZVAXfFdCg9zHH"
+app_name = "gnlwls's app"
+```
+
+```{r}
+myToken = create_token(app = app_name,
+             consumer_key = key, 
+             consumer_secret = secret,
+             access_token = access,
+             access_secret = access_secret)
+```
+
+```{r}
+timeline_1 = get_timeline("stocktwits", n=10000, token=myToken, include_rts = T)
+timeline_2 = get_timeline("marketwatch", n=10000, token=myToken, include_rts = T)
+timeline_3 = get_timeline("yahoofinance", n=10000, token=myToken, include_rts = T)
+timeline_4 = get_timeline("wsjmarkets", n=10000, token=myToken, include_rts = T)
+```
+
+```{r}
+stocks = bind_rows(timeline_1, timeline_2, timeline_3, timeline_4)
+tail(stocks)
+stocks = stocks %>% select(user_id, created_at, status_id, text, screen_name)
+stocks
+```
+
+```{r}
+write_csv(stocks, "../data/project-first-deliverable.csv")
+```
+
+```{r}
+stocks = stocks %>% mutate(text = str_to_lower(text))
+stocks %>% head
+```
+
+
+```{r}
+stocks = stocks %>% mutate(AAPL = str_detect(text, "aapl|apple"))
+stocks %>% head
+```
+
+```{r}
+stocks %>% head
+```
+
+```{r}
+nrc_lexicon = get_sentiments("nrc")
+nrc_lexicon %>% head
+```
+
+```{r}
+stocks1 = stocks %>% unnest_tokens(word, text)  %>% anti_join(stop_words, by="word") %>% filter(str_detect(word,"^[a-z]+$"))
+stocks1
+stocks1 %>% filter(!word %in% stop_words$word)
+```
+
+```{r}
+stocks1 %>% anti_join(stop_words, by="word") %>% 
+  count(word,user_id, AAPL, created_at) %>% bind_tf_idf(word,user_id,n) %>% 
+  select(word,user_id, tf_idf, AAPL, created_at) 
+```
+
+```{r}
+stocks2 = stocks1 %>% anti_join(stop_words, by="word") %>% 
+  inner_join(nrc_lexicon, by="word") %>% 
+  count(user_id,sentiment, created_at, AAPL) %>% 
+  pivot_wider(names_from = sentiment, values_from=n,
+                values_fill=0)
+```
+
+```{r}
+stocks2 = stocks2 %>% mutate(created_at = as_date(created_at, tz = NULL))
+stocks2 = stocks2 %>% convert(int(AAPL))
+stocks2
+```
+
+```{r}
+stocks3 = stocks2 %>% group_by(created_at) %>% summarise(anger =sum(anger), anticipation=sum(anger), disgust = sum(disgust), fear = sum(fear), joy = sum(joy), negative = sum(negative), positive = sum(positive), sadness = sum(sadness), surprise = sum(surprise), trust = sum(trust), AAPL = mean(AAPL))
+stocks3
+```
+
+```{r}
+r = c("AAPL") %>% tq_get(get = "stock.prices",
+                                 from = "2020-10-26",
+                                 to = "2021-12-10")
+```
+
+```{r}
+stocks3 = stocks3 %>% mutate(date = created_at)
+stocks3 %>% head
+final = stocks3 %>% left_join(r,by="date")
+final %>% head
+```
+
+```{r}
+final2 = final %>% mutate(anger = lag(anger), anticipation = lag(anticipation, na.rm=TRUE), disgust = lag(disgust, na.rm=TRUE), fear = lag(fear, na.rm=TRUE), negative = lag(negative, na.rm=TRUE), positive = lag(positive, na.rm=TRUE), sadness = lag(sadness, na.rm=TRUE), surprise = lag(surprise, na.rm=TRUE), trust = lag(trust, na.rm=TRUE), joy = lag(joy, na.rm=TRUE))
+final2 %>% head
+```
+
+```{r}
+final2 = final2 %>% filter(created_at != "2020-10-26")
+final2
+final2 %>%  ggplot(aes(x=date, y=adjusted))+geom_line()+geom_smooth()+theme_tufte()
+```
+
+```{r}
+write_csv(final2, "../data/final2stocks.csv")
+```
+
+```{r}
+stonks = read_csv("../data/final2stocks.csv")
+```
+
+```{r}
+stonks
+#d = stonks  %>%  mutate(across(AAPL, factor))
+stonkstemp = stonks %>% filter(!is.na(adjusted))
+mean(stonkstemp$adjusted)
+stonks = stonks %>% mutate(adjusted = if_na(adjusted, 135.6478))
+stonks
+```
+
+```{r}
+split = initial_split(stonks, prop=5/6)
+trs_ = training(split)
+ts_ = testing(split)
+trs_
+```
+
+```{r}
+rec = recipe(adjusted ~ anger + anticipation + disgust + fear + joy + positive + negative + sadness + surprise + trust + AAPL, trs_) %>% 
+  step_dummy(all_nominal(), -all_outcomes())
+rec
+```
+
+```{r}
+lm_reg = linear_reg() %>% 
+  set_engine("lm") %>% 
+  set_mode("regression") 
+
+xgboost_reg = boost_tree() %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+dt_reg = decision_tree() %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+```
+
+```{r}
+basicwork = workflow() %>% add_model(lm_reg) %>% 
+  add_recipe(rec)
+```
+
+
+```{r}
+logit_fit = basicwork %>% fit(trs_)
+p = predict(logit_fit, ts_) %>%  bind_cols(ts_ %>% select(adjusted))
+p
+```
+
+```{r}
+evalRegression = function(curWorkflow){
+  c = curWorkflow %>% fit(data=trs_)
+  p1 = predict(c, ts_) %>% 
+  bind_cols(ts_ %>% select(adjusted))
+  t1 = p1 %>% mae(.pred, adjusted)
+  t2 = p1 %>% rmse(.pred, adjusted)
+  return(bind_rows(t1,t2))
+}
+```
+
+```{r}
+lg_model = basicwork %>% evalRegression() %>% mutate(model = "lm",recipe="rec")
+xbg_model = basicwork %>% update_model(xgboost_reg) %>% evalRegression %>% mutate(model = "xg",recipe="rec")
+dt_model = basicwork %>% update_model(dt_reg) %>% evalRegression %>% mutate(model = "dt",recipe="rec")
+```
+
+```{r}
+models = bind_rows(lg_model,xbg_model,dt_model)
+models
+```
+
+```{r}
+models %>%  ggplot(aes(x=model, y = .estimate, fill = model) )+
+  geom_col() + facet_wrap(~recipe)
+```
+
+```{r}
+models %>% ggplot(aes(x = model,y = .estimate, fill =model))+
+  geom_col()+facet_wrap(~.metric)
+```
